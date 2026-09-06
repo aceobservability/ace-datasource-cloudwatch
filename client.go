@@ -304,31 +304,28 @@ func (c *Client) queryLogs(ctx context.Context, query string, start, end time.Ti
 }
 
 func (c *Client) awsConfig(ctx context.Context) (aws.Config, error) {
+	accessKeyID := strings.TrimSpace(c.parsed.AccessKeyID)
+	secretAccessKey := strings.TrimSpace(c.parsed.SecretAccessKey)
+	if accessKeyID == "" || secretAccessKey == "" {
+		// Never LoadDefaultConfig without static keys: env/shared/instance
+		// role would SigV4-sign whatever host the SDK (or BaseEndpoint) hits.
+		return aws.Config{}, fmt.Errorf("cloudwatch auth_config requires both access_key_id and secret_access_key")
+	}
+
 	loadOptions := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(c.parsed.Region),
 		awsconfig.WithHTTPClient(c.httpClient),
-	}
-
-	endpoint := customEndpoint(c.cfg.URL)
-	if endpoint != "" {
-		loadOptions = append(loadOptions, awsconfig.WithBaseEndpoint(endpoint))
-	}
-
-	accessKeyID := strings.TrimSpace(c.parsed.AccessKeyID)
-	secretAccessKey := strings.TrimSpace(c.parsed.SecretAccessKey)
-	if accessKeyID != "" || secretAccessKey != "" {
-		if accessKeyID == "" || secretAccessKey == "" {
-			return aws.Config{}, fmt.Errorf("cloudwatch auth_config requires both access_key_id and secret_access_key")
-		}
-		loadOptions = append(loadOptions, awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
 			accessKeyID,
 			secretAccessKey,
 			c.parsed.SessionToken,
-		)))
-	} else if endpoint != "" {
-		// Custom BaseEndpoint + default chain would SigV4-sign attacker or
-		// RFC1918 URLs with platform credentials (confused deputy).
-		return aws.Config{}, fmt.Errorf("cloudwatch custom endpoint requires access_key_id and secret_access_key")
+		)),
+	}
+
+	// Non-amazon URL only (httptest, LocalStack). Amazon hosts never get a
+	// shared BaseEndpoint so metrics vs logs keep SDK dual-host resolution.
+	if endpoint := customEndpoint(c.cfg.URL); endpoint != "" {
+		loadOptions = append(loadOptions, awsconfig.WithBaseEndpoint(endpoint))
 	}
 
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, loadOptions...)
