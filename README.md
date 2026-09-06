@@ -21,7 +21,9 @@ datasource credentials. The AWS SDK uses that client for CloudWatch Metrics and
 Logs API calls.
 
 `cfg.URL` is a custom AWS endpoint when it is not an `*.amazonaws.com` /
-`*.amazon.com` host (httptest, LocalStack). Production URLs such as
+`*.amazon.com` host (httptest, LocalStack). Custom endpoints require static
+`access_key_id` and `secret_access_key` so Ace does not SigV4-sign them with
+the host default credential chain. Production URLs such as
 `https://monitoring.us-east-1.amazonaws.com` leave endpoint resolution to the
 SDK so metrics and logs keep their service-specific hosts.
 
