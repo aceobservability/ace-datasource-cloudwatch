@@ -306,8 +306,7 @@ func TestCustomEndpoint_ignoresAmazonHosts(t *testing.T) {
 	}
 }
 
-func TestAWSConfig_customEndpointRequiresStaticKeys(t *testing.T) {
-	// Env default-chain creds must not be used for a custom BaseEndpoint.
+func TestAWSConfig_omittedStaticKeysDoNotUseDefaultChain(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "DEFAULTCHAIN")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "DEFAULTCHAINSECRET")
 	t.Setenv("AWS_SESSION_TOKEN", "")
@@ -321,56 +320,64 @@ func TestAWSConfig_customEndpointRequiresStaticKeys(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	client, err := New(datasource.Config{
-		Type:       Type,
-		URL:        srv.URL,
-		AuthConfig: json.RawMessage(`{"region":"us-east-1"}`),
-	}, srv.Client())
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{name: "custom httptest URL", url: srv.URL},
+		{name: "amazon metrics host", url: "https://monitoring.us-east-1.amazonaws.com"},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := New(datasource.Config{
+				Type:       Type,
+				URL:        tc.url,
+				AuthConfig: json.RawMessage(`{"region":"us-east-1"}`),
+			}, srv.Client())
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
 
-	_, err = client.awsConfig(ctx)
-	if err == nil {
-		t.Fatal("expected awsConfig to reject custom endpoint without static keys")
-	}
-	if !strings.Contains(err.Error(), "cloudwatch custom endpoint requires access_key_id and secret_access_key") {
-		t.Fatalf("awsConfig error: %v", err)
-	}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
-	if err := client.TestConnection(ctx); err == nil {
-		t.Fatal("expected TestConnection to fail closed")
-	} else if !strings.Contains(err.Error(), "cloudwatch custom endpoint requires access_key_id and secret_access_key") {
-		t.Fatalf("TestConnection error: %v", err)
-	}
+			_, err = client.awsConfig(ctx)
+			if err == nil {
+				t.Fatal("expected awsConfig to reject omitted static keys")
+			}
+			if !strings.Contains(err.Error(), "cloudwatch auth_config requires both access_key_id and secret_access_key") {
+				t.Fatalf("awsConfig error: %v", err)
+			}
 
-	start := time.Now().Add(-time.Hour)
-	end := time.Now()
-	if _, err := client.Query(ctx, "AWS/EC2:CPUUtilization", start, end, time.Minute, 0); err == nil {
-		t.Fatal("expected Query to fail closed")
-	} else if !strings.Contains(err.Error(), "cloudwatch custom endpoint requires access_key_id and secret_access_key") {
-		t.Fatalf("Query error: %v", err)
+			if err := client.TestConnection(ctx); err == nil {
+				t.Fatal("expected TestConnection to fail closed")
+			} else if !strings.Contains(err.Error(), "cloudwatch auth_config requires both access_key_id and secret_access_key") {
+				t.Fatalf("TestConnection error: %v", err)
+			}
+
+			start := time.Now().Add(-time.Hour)
+			end := time.Now()
+			if _, err := client.Query(ctx, "AWS/EC2:CPUUtilization", start, end, time.Minute, 0); err == nil {
+				t.Fatal("expected Query to fail closed")
+			} else if !strings.Contains(err.Error(), "cloudwatch auth_config requires both access_key_id and secret_access_key") {
+				t.Fatalf("Query error: %v", err)
+			}
+		})
 	}
 
 	if hits != 0 {
-		t.Fatalf("must not send SigV4 to custom endpoint without static keys, hits=%d", hits)
+		t.Fatalf("must not send SigV4 without static keys, hits=%d", hits)
 	}
 }
 
-func TestAWSConfig_amazonHostAllowsDefaultChain(t *testing.T) {
-	t.Setenv("AWS_ACCESS_KEY_ID", "DEFAULTCHAIN")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "DEFAULTCHAINSECRET")
-	t.Setenv("AWS_SESSION_TOKEN", "")
-	t.Setenv("AWS_PROFILE", "")
-	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+func TestAWSConfig_amazonHostDoesNotSetBaseEndpoint(t *testing.T) {
+	t.Parallel()
 
 	client, err := New(datasource.Config{
 		Type:       Type,
 		URL:        "https://monitoring.us-east-1.amazonaws.com",
-		AuthConfig: json.RawMessage(`{"region":"us-east-1"}`),
+		AuthConfig: json.RawMessage(`{"region":"us-east-1","access_key_id":"AKID","secret_access_key":"SECRET"}`),
 	}, http.DefaultClient)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -387,10 +394,10 @@ func TestAWSConfig_amazonHostAllowsDefaultChain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Retrieve: %v", err)
 	}
-	if creds.AccessKeyID != "DEFAULTCHAIN" {
-		t.Fatalf("amazon host should use default chain, got access key %q", creds.AccessKeyID)
+	if creds.AccessKeyID != "AKID" {
+		t.Fatalf("expected static key AKID, got %q", creds.AccessKeyID)
 	}
 	if cfg.BaseEndpoint != nil && strings.TrimSpace(*cfg.BaseEndpoint) != "" {
-		t.Fatalf("amazon host must not set BaseEndpoint, got %q", *cfg.BaseEndpoint)
+		t.Fatalf("amazon host must not set BaseEndpoint (collapses metrics/logs), got %q", *cfg.BaseEndpoint)
 	}
 }
