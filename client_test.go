@@ -147,3 +147,250 @@ func TestNew_requiresRegion(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestQueryAndTestConnection_againstFixtureHTTP(t *testing.T) {
+	t.Parallel()
+
+	var sawGetMetricData, sawListMetrics, sawStartQuery, sawGetQueryResults, sawDescribeLogGroups bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		target := r.Header.Get("X-Amz-Target")
+		path := r.URL.Path
+
+		switch {
+		case strings.Contains(path, "/operation/GetMetricData"):
+			sawGetMetricData = true
+			w.Header().Set("Content-Type", "application/cbor")
+			w.Header().Set("Smithy-Protocol", "rpc-v2-cbor")
+			_, _ = w.Write(cbor.Encode(cbor.Map{
+				"MetricDataResults": cbor.List{
+					cbor.Map{
+						"Id":         cbor.String("m1"),
+						"Label":      cbor.String("CPUUtilization"),
+						"StatusCode": cbor.String("Complete"),
+						"Timestamps": cbor.List{
+							&cbor.Tag{ID: 1, Value: cbor.Uint(1600000000)},
+						},
+						"Values": cbor.List{cbor.Float64(1.5)},
+					},
+				},
+			}))
+		case strings.Contains(path, "/operation/ListMetrics"):
+			sawListMetrics = true
+			w.Header().Set("Content-Type", "application/cbor")
+			w.Header().Set("Smithy-Protocol", "rpc-v2-cbor")
+			_, _ = w.Write(cbor.Encode(cbor.Map{
+				"Metrics": cbor.List{},
+			}))
+		case strings.Contains(target, "StartQuery"):
+			sawStartQuery = true
+			w.Header().Set("Content-Type", "application/x-amz-json-1.1")
+			_, _ = w.Write([]byte(`{"queryId":"q-123"}`))
+		case strings.Contains(target, "GetQueryResults"):
+			sawGetQueryResults = true
+			w.Header().Set("Content-Type", "application/x-amz-json-1.1")
+			_, _ = w.Write([]byte(`{"status":"Complete","results":[[{"field":"@timestamp","value":"2020-09-13T12:26:40Z"},{"field":"@message","value":"hello error"},{"field":"level","value":"error"}]]}`))
+		case strings.Contains(target, "DescribeLogGroups"):
+			sawDescribeLogGroups = true
+			w.Header().Set("Content-Type", "application/x-amz-json-1.1")
+			_, _ = w.Write([]byte(`{"logGroups":[{"logGroupName":"/aws/lambda/my-fn"}]}`))
+		default:
+			t.Errorf("unexpected aws call method=%s path=%s target=%q body=%s", r.Method, path, target, body)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := New(datasource.Config{
+		Type: Type,
+		URL:  srv.URL,
+		AuthConfig: json.RawMessage(`{
+			"region":"us-east-1",
+			"access_key_id":"AKID",
+			"secret_access_key":"SECRET",
+			"metric_namespace":"AWS/EC2",
+			"log_group":"/aws/lambda/my-fn"
+		}`),
+	}, srv.Client())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Unix(1600000000, 0).Add(-time.Hour)
+	end := time.Unix(1600000000, 0)
+	result, err := client.Query(ctx, "AWS/EC2:CPUUtilization", start, end, time.Minute, 0)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("Query status=%q error=%q", result.Status, result.Error)
+	}
+	if result.ResultType != "metrics" {
+		t.Fatalf("ResultType=%q, want metrics", result.ResultType)
+	}
+	if result.Data == nil || len(result.Data.Result) != 1 {
+		t.Fatalf("expected 1 series, got %+v", result.Data)
+	}
+	if result.Data.Result[0].Metric["metric_name"] != "CPUUtilization" {
+		t.Fatalf("metric labels=%v", result.Data.Result[0].Metric)
+	}
+	if len(result.Data.Result[0].Values) != 1 {
+		t.Fatalf("expected 1 datapoint, got %+v", result.Data.Result[0].Values)
+	}
+	if !sawGetMetricData {
+		t.Fatal("expected fixture to receive GetMetricData")
+	}
+
+	logs, err := client.QueryWithSignal(ctx, "fields @timestamp, @message", "logs", start, end, time.Minute, 20)
+	if err != nil {
+		t.Fatalf("QueryWithSignal logs: %v", err)
+	}
+	if logs.Status != "success" || logs.ResultType != "logs" {
+		t.Fatalf("logs status=%q resultType=%q error=%q", logs.Status, logs.ResultType, logs.Error)
+	}
+	if logs.Data == nil || len(logs.Data.Logs) != 1 {
+		t.Fatalf("expected 1 log entry, got %+v", logs.Data)
+	}
+	if logs.Data.Logs[0].Line != "hello error" {
+		t.Fatalf("log line=%q", logs.Data.Logs[0].Line)
+	}
+	if logs.Data.Logs[0].Level != "error" {
+		t.Fatalf("log level=%q, want error", logs.Data.Logs[0].Level)
+	}
+	if !sawStartQuery || !sawGetQueryResults {
+		t.Fatalf("expected StartQuery and GetQueryResults, start=%v get=%v", sawStartQuery, sawGetQueryResults)
+	}
+
+	if err := client.TestConnection(ctx); err != nil {
+		t.Fatalf("TestConnection: %v", err)
+	}
+	if !sawListMetrics {
+		t.Fatal("expected TestConnection to hit ListMetrics")
+	}
+	if !sawDescribeLogGroups {
+		t.Fatal("expected TestConnection to hit DescribeLogGroups")
+	}
+}
+
+func TestQueryWithSignal_rejectsUnknownSignal(t *testing.T) {
+	t.Parallel()
+
+	client, err := New(datasource.Config{
+		Type:       Type,
+		AuthConfig: json.RawMessage(`{"region":"us-east-1","access_key_id":"AKID","secret_access_key":"SECRET"}`),
+	}, http.DefaultClient)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = client.QueryWithSignal(context.Background(), "up", "traces", time.Now().Add(-time.Hour), time.Now(), time.Minute, 0)
+	if err == nil {
+		t.Fatal("expected error for unknown signal")
+	}
+	if !strings.Contains(err.Error(), "metrics or logs") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCustomEndpoint_ignoresAmazonHosts(t *testing.T) {
+	t.Parallel()
+
+	if got := customEndpoint("https://monitoring.us-east-1.amazonaws.com"); got != "" {
+		t.Fatalf("amazonaws host should use SDK default endpoints, got %q", got)
+	}
+	if got := customEndpoint("http://127.0.0.1:4566"); got == "" {
+		t.Fatal("loopback custom endpoint should be kept")
+	}
+}
+
+func TestAWSConfig_customEndpointRequiresStaticKeys(t *testing.T) {
+	// Env default-chain creds must not be used for a custom BaseEndpoint.
+	t.Setenv("AWS_ACCESS_KEY_ID", "DEFAULTCHAIN")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "DEFAULTCHAINSECRET")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := New(datasource.Config{
+		Type:       Type,
+		URL:        srv.URL,
+		AuthConfig: json.RawMessage(`{"region":"us-east-1"}`),
+	}, srv.Client())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = client.awsConfig(ctx)
+	if err == nil {
+		t.Fatal("expected awsConfig to reject custom endpoint without static keys")
+	}
+	if !strings.Contains(err.Error(), "cloudwatch custom endpoint requires access_key_id and secret_access_key") {
+		t.Fatalf("awsConfig error: %v", err)
+	}
+
+	if err := client.TestConnection(ctx); err == nil {
+		t.Fatal("expected TestConnection to fail closed")
+	} else if !strings.Contains(err.Error(), "cloudwatch custom endpoint requires access_key_id and secret_access_key") {
+		t.Fatalf("TestConnection error: %v", err)
+	}
+
+	start := time.Now().Add(-time.Hour)
+	end := time.Now()
+	if _, err := client.Query(ctx, "AWS/EC2:CPUUtilization", start, end, time.Minute, 0); err == nil {
+		t.Fatal("expected Query to fail closed")
+	} else if !strings.Contains(err.Error(), "cloudwatch custom endpoint requires access_key_id and secret_access_key") {
+		t.Fatalf("Query error: %v", err)
+	}
+
+	if hits != 0 {
+		t.Fatalf("must not send SigV4 to custom endpoint without static keys, hits=%d", hits)
+	}
+}
+
+func TestAWSConfig_amazonHostAllowsDefaultChain(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "DEFAULTCHAIN")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "DEFAULTCHAINSECRET")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	client, err := New(datasource.Config{
+		Type:       Type,
+		URL:        "https://monitoring.us-east-1.amazonaws.com",
+		AuthConfig: json.RawMessage(`{"region":"us-east-1"}`),
+	}, http.DefaultClient)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg, err := client.awsConfig(ctx)
+	if err != nil {
+		t.Fatalf("awsConfig: %v", err)
+	}
+	creds, err := cfg.Credentials.Retrieve(ctx)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if creds.AccessKeyID != "DEFAULTCHAIN" {
+		t.Fatalf("amazon host should use default chain, got access key %q", creds.AccessKeyID)
+	}
+	if cfg.BaseEndpoint != nil && strings.TrimSpace(*cfg.BaseEndpoint) != "" {
+		t.Fatalf("amazon host must not set BaseEndpoint, got %q", *cfg.BaseEndpoint)
+	}
+}
